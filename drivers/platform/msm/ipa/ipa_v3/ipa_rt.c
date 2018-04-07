@@ -940,7 +940,8 @@ static int __ipa_rt_validate_hndls(const struct ipa_rt_rule *rule,
 static int __ipa_create_rt_entry(struct ipa3_rt_entry **entry,
 		const struct ipa_rt_rule *rule,
 		struct ipa3_rt_tbl *tbl, struct ipa3_hdr_entry *hdr,
-		struct ipa3_hdr_proc_ctx_entry *proc_ctx)
+struct ipa3_hdr_proc_ctx_entry *proc_ctx,
+		u16 rule_id, bool user)
 {
 	int id;
 
@@ -962,6 +963,7 @@ static int __ipa_create_rt_entry(struct ipa3_rt_entry **entry,
 		goto alloc_rule_id_fail;
 	}
 	(*(entry))->rule_id = id;
+	(*(entry))->ipacm_installed = user;
 
 	return 0;
 
@@ -1006,7 +1008,8 @@ ipa_insert_failed:
 }
 
 static int __ipa_add_rt_rule(enum ipa_ip_type ip, const char *name,
-		const struct ipa_rt_rule *rule, u8 at_rear, u32 *rule_hdl)
+		const struct ipa_rt_rule *rule, u8 at_rear, u32 *rule_hdl,
+		u16 rule_id, bool user)
 {
 	struct ipa3_rt_tbl *tbl;
 	struct ipa3_rt_entry *entry;
@@ -1033,7 +1036,8 @@ static int __ipa_add_rt_rule(enum ipa_ip_type ip, const char *name,
 		goto error;
 	}
 
-	if (__ipa_create_rt_entry(&entry, rule, tbl, hdr, proc_ctx))
+	if (__ipa_create_rt_entry(&entry, rule, tbl, hdr, proc_ctx,
+		rule_id, user))
 		goto error;
 
 	if (at_rear)
@@ -1064,7 +1068,7 @@ static int __ipa_add_rt_rule_after(struct ipa3_rt_tbl *tbl,
 	if (__ipa_rt_validate_hndls(rule, &hdr, &proc_ctx))
 		goto error;
 
-	if (__ipa_create_rt_entry(&entry, rule, tbl, hdr, proc_ctx))
+	if (__ipa_create_rt_entry(&entry, rule, tbl, hdr, proc_ctx, 0, true))
 		goto error;
 
 	list_add(&entry->link, &((*add_after_entry)->link));
@@ -1093,7 +1097,23 @@ error:
  *
  * Note:	Should not be called from atomic context
  */
+
 int ipa3_add_rt_rule(struct ipa_ioc_add_rt_rule *rules)
+{
+	return ipa3_add_rt_rule_usr(rules, false);
+}
+/**
+ * ipa3_add_rt_rule_usr() - Add the specified routing rules to SW and optionally
+ * commit to IPA HW
+ * @rules:		[inout] set of routing rules to add
+ * @user_only:	[in] indicate installed by userspace module
+ *
+ * Returns:	0 on success, negative on failure
+ *
+ * Note:	Should not be called from atomic context
+ */
+
+int ipa3_add_rt_rule_usr(struct ipa_ioc_add_rt_rule *rules, bool user_only)
 {
 	int i;
 	int ret;
@@ -1108,8 +1128,10 @@ int ipa3_add_rt_rule(struct ipa_ioc_add_rt_rule *rules)
 		if (__ipa_add_rt_rule(rules->ip, rules->rt_tbl_name,
 					&rules->rules[i].rule,
 					rules->rules[i].at_rear,
-					&rules->rules[i].rt_rule_hdl)) {
-			IPAERR_RL("failed to add rt rule %d\n", i);
+                                        &rules->rules[i].rt_rule_hdl,
+					0,
+					user_only)) {
+			IPAERR("failed to add rt rule %d\n", i);
 			rules->rules[i].status = IPA_RT_STATUS_OF_ADD_FAILED;
 		} else {
 			rules->rules[i].status = 0;
@@ -1382,13 +1404,14 @@ bail:
 /**
  * ipa3_reset_rt() - reset the current SW routing table of specified type
  * (does not commit to HW)
- * @ip:	The family of routing tables
+ * @ip:			[in] The family of routing tables
+ * @user_only:	[in] indicate delete rules installed by userspace
  *
  * Returns:	0 on success, negative on failure
  *
  * Note:	Should not be called from atomic context
  */
-int ipa3_reset_rt(enum ipa_ip_type ip)
+int ipa3_reset_rt(enum ipa_ip_type ip, bool user_only)
 {
 	struct ipa3_rt_tbl *tbl;
 	struct ipa3_rt_tbl *tbl_next;
@@ -1400,6 +1423,7 @@ int ipa3_reset_rt(enum ipa_ip_type ip)
 	struct ipa3_hdr_proc_ctx_entry *hdr_proc_entry;
 	u32 apps_start_idx;
 	int id;
+	bool tbl_user = false;
 
 	if (ip >= IPA_IP_MAX) {
 		IPAERR_RL("bad parm\n");
@@ -1417,7 +1441,7 @@ int ipa3_reset_rt(enum ipa_ip_type ip)
 	 * issue a reset on the filtering module of same IP type since
 	 * filtering rules point to routing tables
 	 */
-	if (ipa3_reset_flt(ip))
+	if (ipa3_reset_flt(ip, user_only))
 		IPAERR_RL("fail to reset flt ip=%d\n", ip);
 
 	set = &ipa3_ctx->rt_tbl_set[ip];
@@ -1425,6 +1449,7 @@ int ipa3_reset_rt(enum ipa_ip_type ip)
 	mutex_lock(&ipa3_ctx->lock);
 	IPADBG("reset rt ip=%d\n", ip);
 	list_for_each_entry_safe(tbl, tbl_next, &set->head_rt_tbl_list, link) {
+		tbl_user = false;
 		list_for_each_entry_safe(rule, rule_next,
 					 &tbl->head_rt_rule_list, link) {
 			if (ipa3_id_find(rule->id) == NULL) {
@@ -1433,6 +1458,12 @@ int ipa3_reset_rt(enum ipa_ip_type ip)
 				return -EFAULT;
 			}
 
+			/* indicate if tbl used for user-specified rules*/
+			if (rule->ipacm_installed) {
+				IPADBG("tbl_user %d, tbl-index %d\n",
+				tbl_user, tbl->id);
+				tbl_user = true;
+			}
 			/*
 			 * for the "default" routing tbl, remove all but the
 			 *  last rule
@@ -1440,6 +1471,8 @@ int ipa3_reset_rt(enum ipa_ip_type ip)
 			if (tbl->idx == apps_start_idx && tbl->rule_cnt == 1)
 				continue;
 
+			if (!user_only ||
+				rule->ipacm_installed) {
 			list_del(&rule->link);
 			if (rule->hdr) {
 				hdr_entry = ipa3_id_find(
@@ -1474,6 +1507,7 @@ int ipa3_reset_rt(enum ipa_ip_type ip)
 
 			/* remove the handle from the database */
 			ipa3_id_remove(id);
+			}
 		}
 
 		if (ipa3_id_find(tbl->id) == NULL) {
@@ -1485,26 +1519,30 @@ int ipa3_reset_rt(enum ipa_ip_type ip)
 
 		/* do not remove the "default" routing tbl which has index 0 */
 		if (tbl->idx != apps_start_idx) {
-			idr_destroy(&tbl->rule_ids);
-			if (tbl->in_sys[IPA_RULE_HASHABLE] ||
-				tbl->in_sys[IPA_RULE_NON_HASHABLE]) {
-				list_move(&tbl->link, &rset->head_rt_tbl_list);
-				clear_bit(tbl->idx,
+			if (!user_only || tbl_user) {
+				idr_destroy(&tbl->rule_ids);
+				if (tbl->in_sys[IPA_RULE_HASHABLE] ||
+					tbl->in_sys[IPA_RULE_NON_HASHABLE]) {
+					list_move(&tbl->link,
+						&rset->head_rt_tbl_list);
+					clear_bit(tbl->idx,
 					  &ipa3_ctx->rt_idx_bitmap[ip]);
-				set->tbl_cnt--;
-				IPADBG("rst sys rt tbl_idx=%d tbl_cnt=%d\n",
+					set->tbl_cnt--;
+					IPADBG("rst tbl_idx=%d cnt=%d\n",
 						tbl->idx, set->tbl_cnt);
-			} else {
-				list_del(&tbl->link);
-				set->tbl_cnt--;
-				clear_bit(tbl->idx,
+				} else {
+					list_del(&tbl->link);
+					set->tbl_cnt--;
+					clear_bit(tbl->idx,
 					  &ipa3_ctx->rt_idx_bitmap[ip]);
-				IPADBG("rst rt tbl_idx=%d tbl_cnt=%d\n",
+					IPADBG("rst rt tbl_idx=%d tbl_cnt=%d\n",
 						tbl->idx, set->tbl_cnt);
-				kmem_cache_free(ipa3_ctx->rt_tbl_cache, tbl);
+					kmem_cache_free(ipa3_ctx->rt_tbl_cache,
+						tbl);
+				}
+				/* remove the handle from the database */
+				ipa3_id_remove(id);
 			}
-			/* remove the handle from the database */
-			ipa3_id_remove(id);
 		}
 	}
 	mutex_unlock(&ipa3_ctx->lock);
@@ -1619,6 +1657,7 @@ static int __ipa_mdfy_rt_rule(struct ipa_rt_rule_mdfy *rtrule)
 	struct ipa3_hdr_proc_ctx_entry *proc_ctx = NULL;
 	struct ipa3_hdr_entry *hdr_entry;
 	struct ipa3_hdr_proc_ctx_entry *hdr_proc_entry;
+
 	if (rtrule->rule.hdr_hdl) {
 		hdr = ipa3_id_find(rtrule->rule.hdr_hdl);
 		if ((hdr == NULL) || (hdr->cookie != IPA_HDR_COOKIE)) {
